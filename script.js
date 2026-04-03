@@ -1,9 +1,26 @@
 // Main application logic
 import { getRandomSentences, getLanguages, getDifficulties } from './sentences.js';
-import { addScore, getTop10, getUserBest, formatDate } from './leaderboard.js';
+import { addScore, getTop10, formatDate, getLeaderboardMode } from './leaderboard.js';
 import { playKeySound, playErrorSound, playSuccessSound, toggleSound, isSoundEnabled } from './sounds.js';
 import { launchConfetti } from './confetti.js';
 import { renderErrorTable, renderPerformanceGraph, renderHighlights } from './analytics.js';
+
+const TEST_CONFIG = {
+  sentenceCountByDifficulty: { easy: 2, medium: 3, hard: 4 },
+  highScoreWpmThreshold: 60,
+  highAccuracyThreshold: 95,
+  loadingDelayMs: 100,
+  confettiDelayMs: 300,
+  confettiDurationMs: 3000,
+  inputErrorFlashMs: 1500
+};
+
+const RESULT_TIERS = [
+  { minWpm: 80, title: '🔥 Incredible Speed!', subtitle: 'You are a typing master!' },
+  { minWpm: 60, title: '⚡ Great Job!', subtitle: 'Above average typing speed!' },
+  { minWpm: 40, title: '👍 Nice Work!', subtitle: 'Keep practicing to improve!' },
+  { minWpm: 0, title: '✨ Test Complete!', subtitle: 'Practice makes perfect!' }
+];
 
 // ===== State =====
 const state = {
@@ -64,6 +81,7 @@ const els = {
   resultClose: $('#result-close'),
   leaderboardBody: $('#leaderboard-body'),
   leaderboardEmpty: $('#leaderboard-empty'),
+  leaderboardStatus: $('#lb-status'),
   lbLangFilter: $('#lb-lang-filter'),
   lbDiffFilter: $('#lb-diff-filter'),
   // Analytics elements
@@ -125,7 +143,7 @@ function login() {
   if (!name) {
     els.usernameInput.focus();
     els.usernameInput.style.borderColor = 'var(--error)';
-    setTimeout(() => { els.usernameInput.style.borderColor = ''; }, 1500);
+    setTimeout(() => { els.usernameInput.style.borderColor = ''; }, TEST_CONFIG.inputErrorFlashMs);
     return;
   }
   state.username = name;
@@ -160,7 +178,7 @@ function switchTab(tabName) {
 
 // ===== Text Management =====
 function loadNewText() {
-  const sentenceCount = state.difficulty === 'easy' ? 2 : state.difficulty === 'hard' ? 4 : 3;
+  const sentenceCount = TEST_CONFIG.sentenceCountByDifficulty[state.difficulty] ?? TEST_CONFIG.sentenceCountByDifficulty.medium;
   state.text = getRandomSentences(state.language, state.difficulty, sentenceCount);
   resetTest();
   renderText();
@@ -262,34 +280,26 @@ function finishTest() {
   const stats = calculateStats();
   showResults(stats);
   
-  // Save score to Firebase (async) - wrapped in try/catch for safety
-  try {
-    addScore({
-      username: state.username,
-      wpm: stats.wpm,
-      accuracy: stats.accuracy,
-      errors: stats.errors,
-      language: state.language,
-      difficulty: state.difficulty,
-      duration: state.duration
-    }).catch(e => {
-      console.warn('Failed to save score:', e);
-    });
-  } catch (e) {
+  // Save score async (Firebase if configured, local fallback otherwise)
+  addScore({
+    username: state.username,
+    wpm: stats.wpm,
+    accuracy: stats.accuracy,
+    errors: stats.errors,
+    language: state.language,
+    difficulty: state.difficulty,
+    duration: state.duration
+  }).catch(e => {
     console.warn('Failed to save score:', e);
-  }
+  });
   
-  try {
-    playSuccessSound();
-  } catch (e) {
-    // Silently fail
-  }
+  playSuccessSound();
   
   // Confetti for high scores
-  if (stats.wpm >= 60 || stats.accuracy >= 95) {
+  if (stats.wpm >= TEST_CONFIG.highScoreWpmThreshold || stats.accuracy >= TEST_CONFIG.highAccuracyThreshold) {
     setTimeout(() => {
-      try { launchConfetti(3000); } catch (e) { /* ignore */ }
-    }, 300);
+      launchConfetti(TEST_CONFIG.confettiDurationMs);
+    }, TEST_CONFIG.confettiDelayMs);
   }
 }
 
@@ -402,19 +412,9 @@ function showResults(stats) {
   els.resultChars.textContent = stats.chars;
   
   // Dynamic title based on performance
-  if (stats.wpm >= 80) {
-    els.resultsTitle.textContent = '🔥 Incredible Speed!';
-    els.resultsSubtitle.textContent = 'You are a typing master!';
-  } else if (stats.wpm >= 60) {
-    els.resultsTitle.textContent = '⚡ Great Job!';
-    els.resultsSubtitle.textContent = 'Above average typing speed!';
-  } else if (stats.wpm >= 40) {
-    els.resultsTitle.textContent = '👍 Nice Work!';
-    els.resultsSubtitle.textContent = 'Keep practicing to improve!';
-  } else {
-    els.resultsTitle.textContent = '✨ Test Complete!';
-    els.resultsSubtitle.textContent = 'Practice makes perfect!';
-  }
+  const resultTier = RESULT_TIERS.find((tier) => stats.wpm >= tier.minWpm) || RESULT_TIERS[RESULT_TIERS.length - 1];
+  els.resultsTitle.textContent = resultTier.title;
+  els.resultsSubtitle.textContent = resultTier.subtitle;
   
   els.resultsModal.classList.add('active');
   
@@ -435,7 +435,7 @@ function showResults(stats) {
     } catch (e) {
       console.warn('Failed to render error table:', e);
     }
-  }, 100);
+  }, TEST_CONFIG.loadingDelayMs);
 }
 
 function hideResults() {
@@ -465,6 +465,7 @@ async function renderLeaderboard() {
     console.warn('Failed to get leaderboard:', e);
     scores = [];
   }
+  updateLeaderboardStatus();
 
   if (!scores || scores.length === 0) {
     els.leaderboardBody.innerHTML = '';
@@ -505,6 +506,17 @@ async function renderLeaderboard() {
       </tr>
     `;
   }).join('');
+}
+
+function updateLeaderboardStatus() {
+  if (!els.leaderboardStatus) return;
+
+  const mode = getLeaderboardMode();
+  const isOnline = mode === 'firebase';
+  els.leaderboardStatus.classList.toggle('offline', !isOnline);
+  els.leaderboardStatus.innerHTML = isOnline
+    ? '<i class="fas fa-globe"></i> Online Global'
+    : '<i class="fas fa-hard-drive"></i> Local Device';
 }
 
 // ===== Event Listeners =====

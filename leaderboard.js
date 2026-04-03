@@ -16,11 +16,16 @@ import {
 let db = null;
 let firebaseReady = false;
 let initPromise = null;
+let lastMode = "initializing";
 
 function getEnvVar(name) {
   // Check multiple sources for the env var
   if (window.__ENV__ && window.__ENV__[name]) return window.__ENV__[name];
+  const prefixedName = `__ENV__${name}`;
+  if (window[prefixedName]) return window[prefixedName];
   if (window[name]) return window[name];
+  const metaTag = document.querySelector(`meta[name="${name}"]`);
+  if (metaTag?.content) return metaTag.content;
   return null;
 }
 
@@ -34,6 +39,7 @@ function initFirebase() {
 
       if (!apiKey || !projectId || apiKey === "FIREBASE_API_KEY_NOT_SET" || projectId === "FIREBASE_PROJECT_ID_NOT_SET") {
         console.warn("Firebase credentials not configured. Using localStorage fallback.");
+        lastMode = "local";
         resolve(false);
         return;
       }
@@ -47,10 +53,12 @@ function initFirebase() {
       const app = initializeApp(firebaseConfig);
       db = getFirestore(app);
       firebaseReady = true;
+      lastMode = "firebase";
       console.log("Firebase Firestore connected successfully!");
       resolve(true);
     } catch (e) {
       console.warn("Firebase init failed, using localStorage fallback:", e);
+      lastMode = "local";
       resolve(false);
     }
   });
@@ -64,6 +72,7 @@ initFirebase();
 // ===== localStorage Fallback =====
 const LEADERBOARD_KEY = "typingtest_leaderboard";
 const MAX_ENTRIES = 50;
+const TOP_LIMIT = 10;
 
 function getLocalLeaderboard() {
   try {
@@ -90,7 +99,7 @@ function getLocalTop10(filter = {}) {
   if (filter.difficulty && filter.difficulty !== "all") {
     scores = scores.filter((s) => s.difficulty === filter.difficulty);
   }
-  return scores.sort((a, b) => b.wpm - a.wpm).slice(0, 10);
+  return scores.sort((a, b) => b.wpm - a.wpm).slice(0, TOP_LIMIT);
 }
 
 // ===== Public API (works with Firebase or localStorage fallback) =====
@@ -118,12 +127,15 @@ export async function addScore(entry) {
   if (firebaseReady && db) {
     try {
       await addDoc(collection(db, "leaderboard"), newEntry);
+      lastMode = "firebase";
       console.log("Score saved to Firebase!");
     } catch (e) {
       console.warn("Firebase save failed, saving locally:", e);
+      lastMode = "local";
       saveLocalScore(newEntry);
     }
   } else {
+    lastMode = "local";
     saveLocalScore(newEntry);
   }
 
@@ -158,13 +170,16 @@ export async function getTop10(filter = {}) {
         scores = scores.filter((s) => s.difficulty === filter.difficulty);
       }
 
-      return scores.sort((a, b) => b.wpm - a.wpm).slice(0, 10);
+      lastMode = "firebase";
+      return scores.sort((a, b) => b.wpm - a.wpm).slice(0, TOP_LIMIT);
     } catch (e) {
       console.warn("Firebase read failed, using localStorage:", e);
+      lastMode = "local";
       return getLocalTop10(filter);
     }
   }
 
+  lastMode = "local";
   return getLocalTop10(filter);
 }
 
@@ -215,4 +230,8 @@ export function formatDate(timestamp) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+export function getLeaderboardMode() {
+  return lastMode;
 }
