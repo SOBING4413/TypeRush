@@ -3,6 +3,7 @@ import { getRandomSentences, getLanguages, getDifficulties } from './sentences.j
 import { addScore, getTop10, getUserBest, formatDate } from './leaderboard.js';
 import { playKeySound, playErrorSound, playSuccessSound, toggleSound, isSoundEnabled } from './sounds.js';
 import { launchConfetti } from './confetti.js';
+import { renderErrorTable, renderPerformanceGraph, renderHighlights } from './analytics.js';
 
 // ===== State =====
 const state = {
@@ -18,7 +19,12 @@ const state = {
   typedChars: 0,
   correctChars: 0,
   errorCount: 0,
-  startTime: null
+  startTime: null,
+  // Analytics tracking
+  errorLog: [],        // {typed, expected, position, time}
+  wpmSnapshots: [],    // {time, wpm, errors} per second
+  lastSnapshotTime: 0,
+  prevErrorCount: 0
 };
 
 // ===== DOM Elements =====
@@ -59,7 +65,11 @@ const els = {
   leaderboardBody: $('#leaderboard-body'),
   leaderboardEmpty: $('#leaderboard-empty'),
   lbLangFilter: $('#lb-lang-filter'),
-  lbDiffFilter: $('#lb-diff-filter')
+  lbDiffFilter: $('#lb-diff-filter'),
+  // Analytics elements
+  wpmGraph: $('#wpm-graph'),
+  errorTableContainer: $('#error-table-container'),
+  highlightsContainer: $('#highlights-container')
 };
 
 // ===== Initialization =====
@@ -181,6 +191,11 @@ function resetTest() {
   state.correctChars = 0;
   state.errorCount = 0;
   state.startTime = null;
+  // Reset analytics
+  state.errorLog = [];
+  state.wpmSnapshots = [];
+  state.lastSnapshotTime = 0;
+  state.prevErrorCount = 0;
 
   els.typingInput.value = '';
   els.typingInput.disabled = false;
@@ -198,17 +213,41 @@ function startTest() {
   
   state.timer = setInterval(() => {
     state.timeLeft--;
-    els.timerDisplay.textContent = state.timeLeft;
+    els.timerDisplay.textContent = Math.max(0, state.timeLeft);
     
     const progress = (state.timeLeft / state.duration) * 100;
-    els.progressBar.style.width = `${progress}%`;
+    els.progressBar.style.width = `${Math.max(0, progress)}%`;
     
     updateLiveStats();
+    recordWpmSnapshot();
     
     if (state.timeLeft <= 0) {
       finishTest();
     }
   }, 1000);
+}
+
+/**
+ * Record a WPM snapshot for the performance graph
+ */
+function recordWpmSnapshot() {
+  if (!state.startTime) return;
+  const elapsedSec = Math.round((Date.now() - state.startTime) / 1000);
+  if (elapsedSec <= state.lastSnapshotTime && state.wpmSnapshots.length > 0) return;
+
+  const elapsedMin = Math.max(elapsedSec / 60, 0.01);
+  const wordsTyped = state.correctChars / 5;
+  const wpm = Math.round(wordsTyped / elapsedMin);
+  const newErrors = state.errorCount - state.prevErrorCount;
+
+  state.wpmSnapshots.push({
+    time: elapsedSec,
+    wpm: Math.max(0, wpm),
+    errors: Math.max(0, newErrors)
+  });
+
+  state.prevErrorCount = state.errorCount;
+  state.lastSnapshotTime = elapsedSec;
 }
 
 function finishTest() {
@@ -217,25 +256,38 @@ function finishTest() {
   state.isFinished = true;
   els.typingInput.disabled = true;
   
+  // Record final snapshot
+  recordWpmSnapshot();
+
   const stats = calculateStats();
   showResults(stats);
   
-  // Save score
-  addScore({
-    username: state.username,
-    wpm: stats.wpm,
-    accuracy: stats.accuracy,
-    errors: stats.errors,
-    language: state.language,
-    difficulty: state.difficulty,
-    duration: state.duration
-  });
+  // Save score - wrapped in try/catch for safety
+  try {
+    addScore({
+      username: state.username,
+      wpm: stats.wpm,
+      accuracy: stats.accuracy,
+      errors: stats.errors,
+      language: state.language,
+      difficulty: state.difficulty,
+      duration: state.duration
+    });
+  } catch (e) {
+    console.warn('Failed to save score:', e);
+  }
   
-  playSuccessSound();
+  try {
+    playSuccessSound();
+  } catch (e) {
+    // Silently fail
+  }
   
   // Confetti for high scores
   if (stats.wpm >= 60 || stats.accuracy >= 95) {
-    setTimeout(() => launchConfetti(3000), 300);
+    setTimeout(() => {
+      try { launchConfetti(3000); } catch (e) { /* ignore */ }
+    }, 300);
   }
 }
 
@@ -250,8 +302,8 @@ function calculateStats() {
   const accuracy = Math.round((state.correctChars / totalTyped) * 1000) / 10;
   
   return {
-    wpm: Math.max(0, wpm),
-    accuracy: Math.min(100, Math.max(0, accuracy)),
+    wpm: Math.max(0, isFinite(wpm) ? wpm : 0),
+    accuracy: Math.min(100, Math.max(0, isFinite(accuracy) ? accuracy : 0)),
     errors: state.errorCount,
     chars: state.typedChars
   };
@@ -271,6 +323,9 @@ function handleTyping() {
   const typed = els.typingInput.value;
   const chars = state.text.split('');
   const charSpans = els.textDisplay.querySelectorAll('.char');
+  
+  // Track previous error positions for error logging
+  const prevTypedLen = state.typedChars;
   
   state.typedChars = typed.length;
   state.correctChars = 0;
@@ -296,6 +351,20 @@ function handleTyping() {
       span.classList.add('pending');
     }
   });
+  
+  // Log new errors for analytics (only for newly typed characters)
+  if (typed.length > prevTypedLen && state.startTime) {
+    const newIdx = typed.length - 1;
+    if (newIdx < chars.length && typed[newIdx] !== chars[newIdx]) {
+      const elapsedSec = (Date.now() - state.startTime) / 1000;
+      state.errorLog.push({
+        typed: typed[newIdx],
+        expected: chars[newIdx],
+        position: newIdx + 1,
+        time: elapsedSec
+      });
+    }
+  }
   
   // Play sound for last character
   if (typed.length > 0) {
@@ -330,7 +399,7 @@ function showResults(stats) {
   els.resultErrors.textContent = stats.errors;
   els.resultChars.textContent = stats.chars;
   
-  // Dynamic title based on performance
+  // Dynamic title based on performance (BUG FIX: was textCntent)
   if (stats.wpm >= 80) {
     els.resultsTitle.textContent = '🔥 Incredible Speed!';
     els.resultsSubtitle.textContent = 'You are a typing master!';
@@ -341,11 +410,30 @@ function showResults(stats) {
     els.resultsTitle.textContent = '👍 Nice Work!';
     els.resultsSubtitle.textContent = 'Keep practicing to improve!';
   } else {
-    els.resultsTitle.textCntent = '✨ Test Complete!';
+    els.resultsTitle.textContent = '✨ Test Complete!';
     els.resultsSubtitle.textContent = 'Practice makes perfect!';
   }
   
   els.resultsModal.classList.add('active');
+  
+  // Render analytics after modal is visible
+  setTimeout(() => {
+    try {
+      renderHighlights(state.wpmSnapshots, state.errorLog, els.highlightsContainer);
+    } catch (e) {
+      console.warn('Failed to render highlights:', e);
+    }
+    try {
+      renderPerformanceGraph(state.wpmSnapshots, els.wpmGraph);
+    } catch (e) {
+      console.warn('Failed to render graph:', e);
+    }
+    try {
+      renderErrorTable(state.errorLog, els.errorTableContainer);
+    } catch (e) {
+      console.warn('Failed to render error table:', e);
+    }
+  }, 100);
 }
 
 function hideResults() {
@@ -356,7 +444,14 @@ function hideResults() {
 function renderLeaderboard() {
   const langFilter = els.lbLangFilter.value;
   const diffFilter = els.lbDiffFilter.value;
-  const scores = getTop10({ language: langFilter, difficulty: diffFilter });
+  
+  let scores;
+  try {
+    scores = getTop10({ language: langFilter, difficulty: diffFilter });
+  } catch (e) {
+    console.warn('Failed to get leaderboard:', e);
+    scores = [];
+  }
 
   if (!scores || scores.length === 0) {
     els.leaderboardBody.innerHTML = '';
